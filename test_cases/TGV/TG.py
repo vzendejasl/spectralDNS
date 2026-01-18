@@ -1,6 +1,7 @@
 from __future__ import print_function
 import warnings
 import os
+import glob
 from numpy import pi, zeros, sum, float64, sin, cos, prod
 import numpy as np
 import h5py
@@ -83,6 +84,111 @@ def initialize2(solver, context):
     U[2] = 0
     solver.set_velocity(**context)
     solver.cross2(context.W_hat, context.K, context.U_hat)
+
+def _select_checkpoint_file(solver, context):
+    params = config.params
+    user_path = getattr(params, "restart_file", None)
+    if user_path:
+        if os.path.exists(user_path):
+            if solver.rank == 0:
+                print("Restart: using user-specified checkpoint {}".format(user_path))
+            return user_path
+        if solver.rank == 0:
+            print("Restart: specified checkpoint not found: {}".format(user_path))
+        return None
+
+    candidates = set()
+    basename = context.hdf5file.filename
+    for path in (basename + "_c.h5", basename + "_c"):
+        if os.path.exists(path):
+            candidates.add(path)
+    for path in glob.glob("*_c.h5") + glob.glob("*_c"):
+        if os.path.exists(path):
+            candidates.add(path)
+
+    best_path = None
+    best_tstep = -1
+    best_t = 0.0
+    for path in sorted(candidates):
+        try:
+            with h5py.File(path, "r") as f:
+                tstep = int(f.attrs.get("tstep", -1))
+                t = float(f.attrs.get("t", 0.0))
+        except Exception:
+            continue
+        if tstep > best_tstep:
+            best_path = path
+            best_tstep = tstep
+            best_t = t
+
+    if best_path is not None and solver.rank == 0:
+        print("Restart: selected checkpoint {} (tstep={}, t={:.16e})".format(
+            best_path, best_tstep, best_t))
+
+    return best_path
+
+def _load_restart(solver, context):
+    params = config.params
+    chk_path = _select_checkpoint_file(solver, context)
+    if chk_path is None:
+        if solver.rank == 0:
+            print("Restart: no checkpoint found, starting from initial conditions.")
+        return False
+
+    local_slice = None
+    if hasattr(context, "T") and hasattr(context.T, "local_slice"):
+        local_slice = context.T.local_slice()
+
+    with h5py.File(chk_path, "r") as f:
+        tstep = int(f.attrs.get("tstep", -1))
+        t = float(f.attrs.get("t", 0.0))
+        if "U" not in f or "3D" not in f["U"]:
+            if solver.rank == 0:
+                print("Restart: checkpoint missing U/3D dataset, skipping restart.")
+            return False
+        group = f["U/3D"]
+        dset_key = "0" if "0" in group else None
+        if dset_key is None:
+            keys = [k for k in group.keys() if k.isdigit()]
+            if not keys:
+                if solver.rank == 0:
+                    print("Restart: no numeric datasets in U/3D, skipping restart.")
+                return False
+            dset_key = sorted(keys, key=int)[0]
+        dset_path = "U/3D/{}".format(dset_key)
+        if solver.rank == 0:
+            print("Restart: located dataset {}".format(dset_path))
+        dset = group[dset_key]
+        if local_slice is not None and dset.shape != context.U_hat.shape:
+            data = dset[(slice(None),) + local_slice]
+        else:
+            data = dset[...]
+
+    if data.shape != context.U_hat.shape:
+        if solver.rank == 0:
+            print("Restart: dataset shape {} does not match U_hat shape {}, skipping restart.".format(
+                data.shape, context.U_hat.shape))
+        return False
+
+    context.U_hat[...] = data
+    params.t = t
+    params.tstep = tstep
+    params.filemode = "a"
+    params.restarted = True
+
+    if solver.rank == 0:
+        print("Restart: loaded t={:.16e}, tstep={}".format(params.t, params.tstep))
+
+    if hasattr(params, "snapshot_times_fields"):
+        while (params.snapshot_index_fields < len(params.snapshot_times_fields) and
+               params.t >= params.snapshot_times_fields[params.snapshot_index_fields] - params.dt * 0.01):
+            params.snapshot_index_fields += 1
+    if hasattr(params, "snapshot_times_spectrum"):
+        while (params.snapshot_index_spectrum < len(params.snapshot_times_spectrum) and
+               params.t >= params.snapshot_times_spectrum[params.snapshot_index_spectrum] - params.dt * 0.01):
+            params.snapshot_index_spectrum += 1
+
+    return True
 
 k = []
 w = []
@@ -241,6 +347,8 @@ if __name__ == "__main__":
     config.triplyperiodic.add_argument("--Re", type=float, default=100.0, help="Reynolds number (defines viscosity)")
     config.triplyperiodic.add_argument("--problem", type=int, default=2, choices=[1, 2],
                                        help="Problem setup: 1 => domain [0, 2*pi]^3 (dt unchanged), 2 => domain [0, 1]^3 (dt scaled by 1/(2*pi))")
+    config.triplyperiodic.add_argument("--restart-file", type=str, default="",
+                                       help="Optional checkpoint file to restart from (defaults to latest found).")
 
     config.triplyperiodic.add_argument("--N", default=[32, 32, 32], nargs=3,
 
@@ -438,18 +546,19 @@ if __name__ == "__main__":
         self = context.hdf5file
 
         if self.cfile is None:
+            if params.get("restarted", False):
+                params.filemode = "a"
 
             self.cfile = ShenfunFile(self.filename+'_c',
-
                                      self.checkpoint['space'],
-
                                      mode=params.filemode)
 
             self.cfile.open()
 
-            self.cfile.f.attrs.create('tstep', 0)
-
-            self.cfile.f.attrs.create('t', 0.0)
+            if 'tstep' not in self.cfile.f.attrs:
+                self.cfile.f.attrs.create('tstep', 0)
+            if 't' not in self.cfile.f.attrs:
+                self.cfile.f.attrs.create('t', 0.0)
 
             self.cfile.close()
 
@@ -464,6 +573,7 @@ if __name__ == "__main__":
 
 
         # Check for schedule or regular interval
+        checkpoint_written = False
         should_write = False
         if hasattr(params, 'snapshot_times_fields'):
              while (params.snapshot_index_fields < len(params.snapshot_times_fields) and 
@@ -485,26 +595,38 @@ if __name__ == "__main__":
             self.wfile.write(params.tstep, self.results['data'], as_scalar=False)
 
             # Save physical time as attribute
-
-            if self.wfile.f:
+            try:
+                close_after = False
+                if self.wfile.f is None:
+                    self.wfile.open()
+                    close_after = True
 
                 for key in self.results['data'].keys():
-
                     try:
-
                         # ShenfunFile structure: /var/3D/step
-
                         if key in self.wfile.f and '3D' in self.wfile.f[key] and str(params.tstep) in self.wfile.f[key]['3D']:
-
                             self.wfile.f[key]['3D'][str(params.tstep)].attrs['time'] = params.t
-
                     except Exception as e:
-
                         if sol.rank == 0:
-
                             print(f"Warning: Could not save time attribute: {e}")
 
-            
+                if close_after:
+                    self.wfile.close()
+            except Exception as e:
+                if sol.rank == 0:
+                    print(f"Warning: Could not open file to save time attribute: {e}")
+
+            # Checkpoint whenever a snapshot is written
+            for key, val in self.checkpoint['data'].items():
+                self.cfile.write(int(key), val)
+            self.cfile.open()
+            self.cfile.f.attrs['tstep'] = params.tstep
+            self.cfile.f.attrs['t'] = params.t
+            self.cfile.close()
+            checkpoint_written = True
+            if sol.rank == 0:
+                print("Checkpoint written at step {} (t={:.16e})".format(
+                    params.tstep, params.t))
 
             if is_snapshot and sol.rank == 0:
 
@@ -514,7 +636,7 @@ if __name__ == "__main__":
 
         kill = self.check_if_kill()
 
-        if params.tstep % params.checkpoint == 0 or kill:
+        if (params.tstep % params.checkpoint == 0 or kill) and not checkpoint_written:
 
             for key, val in self.checkpoint['data'].items():
 
@@ -527,6 +649,9 @@ if __name__ == "__main__":
                 self.cfile.f.attrs['t'] = params.t
 
                 self.cfile.close()
+            if sol.rank == 0:
+                print("Checkpoint written at step {} (t={:.16e})".format(
+                    params.tstep, params.t))
 
 
 
@@ -540,21 +665,17 @@ if __name__ == "__main__":
 
 
 
-    initialize(sol, context)
+    restarted = _load_restart(sol, context)
+    if not restarted:
+        initialize(sol, context)
 
-    
-
-    # Perform initial save/spectrum computation at t=0
-
-    if sol.rank == 0:
-
-        print("Performing initial save at t=0...")
-
-    update(context)
-
-    context.hdf5file.update(config.params, **context)
-
-    
+        # Perform initial save/spectrum computation at t=0
+        if sol.rank == 0:
+            print("Performing initial save at t=0...")
+        update(context)
+        context.hdf5file.update(config.params, **context)
+    elif sol.rank == 0:
+        print("Restart: continuing from checkpoint, skipping initial save.")
 
     solve(sol, context)
 
@@ -573,7 +694,7 @@ if __name__ == "__main__":
 
         if sol.rank == 0:
 
-            print("Performing final save at t={:g}...".format(config.params.t * 2*pi))
+            print("Performing final save at t={:g}...".format(config.params.t))
 
         update(context)
 
