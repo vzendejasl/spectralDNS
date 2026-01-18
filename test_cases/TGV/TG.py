@@ -85,6 +85,25 @@ def initialize2(solver, context):
     solver.set_velocity(**context)
     solver.cross2(context.W_hat, context.K, context.U_hat)
 
+def _format_re(value):
+    text = "{:g}".format(value)
+    return text.replace(".", "p")
+
+def _output_dir(params):
+    return "spectralDNS_tgv_Re{}NumPtsPerDir{}".format(
+        _format_re(params.Re),
+        int(params.N[0]),
+    )
+
+def _base_filename(params):
+    return "tgv_out_Re{}NumPtsPerDir{}".format(
+        _format_re(params.Re),
+        int(params.N[0]),
+    )
+
+def _diagnostics_filename(params):
+    return _base_filename(params) + ".csv"
+
 def _select_checkpoint_file(solver, context):
     params = config.params
     user_path = getattr(params, "restart_file", None)
@@ -102,7 +121,8 @@ def _select_checkpoint_file(solver, context):
     for path in (basename + "_c.h5", basename + "_c"):
         if os.path.exists(path):
             candidates.add(path)
-    for path in glob.glob("*_c.h5") + glob.glob("*_c"):
+    search_dir = params.get("output_dir", ".")
+    for path in glob.glob(os.path.join(search_dir, "*_c.h5")) + glob.glob(os.path.join(search_dir, "*_c")):
         if os.path.exists(path):
             candidates.add(path)
 
@@ -257,7 +277,8 @@ def update(context):
                 print("Sanity Check (t={:.4f}): KE_sim = {:.16e}, Sum(E_k) = {:.16e}, Diff = {:.6e}".format(t_phys, kk, total_Ek, diff))
 
                 # Save to HDF5
-                with h5py.File("energy_spectrum.h5", "a") as f:
+                spec_h5 = os.path.join(params.output_dir, "energy_spectrum.h5")
+                with h5py.File(spec_h5, "a") as f:
                     grp = f.require_group("spectra")
                     if str(params.tstep) in grp:
                         del grp[str(params.tstep)]
@@ -265,7 +286,7 @@ def update(context):
                     dset.attrs["time"] = t_phys
                 
                 # Save to a text file for easy reading
-                out_dir = "spectrum"
+                out_dir = os.path.join(params.output_dir, "spectrum")
                 if not os.path.exists(out_dir):
                     os.makedirs(out_dir)
                     
@@ -289,8 +310,9 @@ def update(context):
                     "Time", "Cycle", "KineticEnergy", "Enstrophy"))
             print("{:26.16e} {:26.16e} {:26.16e} {:26.16e}".format(
                 t_phys, float(params.tstep), float(kk), float(ww)))
-            file_exists = os.path.isfile("diagnostics.csv")
-            with open("diagnostics.csv", "a") as f:
+            diag_file = params.get("diagnostics_filename", "diagnostics.csv")
+            file_exists = os.path.isfile(diag_file)
+            with open(diag_file, "a") as f:
                 if not file_exists:
                     f.write("                      Time,                     Cycle,             KineticEnergy,                 Enstrophy\n")
                 f.write("%26.16e,%26.16e,%26.16e,%26.16e\n" %(t_phys, float(params.tstep), float(kk), float(ww)))
@@ -521,7 +543,16 @@ if __name__ == "__main__":
 
     # method used by the HDF5File class to compute the real fields that are stored
 
-    context.hdf5file.filename = "NS9"
+    config.params.output_dir = _output_dir(config.params)
+    if sol.rank == 0 and not os.path.exists(config.params.output_dir):
+        os.makedirs(config.params.output_dir)
+
+    config.params.base_filename = _base_filename(config.params)
+    config.params.diagnostics_filename = os.path.join(
+        config.params.output_dir, _diagnostics_filename(config.params))
+
+    context.hdf5file.filename = os.path.join(
+        config.params.output_dir, config.params.base_filename)
 
     context.hdf5file.results['data'].update({'curl': [context.curl]})
 
