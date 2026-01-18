@@ -56,3 +56,6 @@ visit -o NS9_w.xdmf
 *   **`NS9_w.xdmf`**: The "map" file used by ParaView/VisIt to read the .h5 file.
 *   **`NS9_c.h5`**: Checkpoint/Mesh file (contains grid coordinates).
 *   **`diagnostics.csv`**: CSV file containing time history of Cycle, Kinetic Energy, Enstrophy, and Divergence.
+
+# Sample Run
+mpirun -np 4 python TG.py --Re 400 --N 32 32 32 --dt 1e-3 --T 6.3662 --num_snapshots 25 --num_spectrum_snapshots 25 --dealias 3/2-rule --snapshot-time 1.43239 --problem 2 NS
