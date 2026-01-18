@@ -69,15 +69,17 @@ def initialize(solver, context):
 
 def initialize1(solver, context):
     U, X = context.U, context.X
-    U[0] = sin(2*pi*X[0])*cos(2*pi*X[1])*cos(2*pi*X[2])
-    U[1] = -cos(2*pi*X[0])*sin(2*pi*X[1])*cos(2*pi*X[2])
+    scale = 1.0/config.params.L_ref
+    U[0] = sin(scale*X[0])*cos(scale*X[1])*cos(scale*X[2])
+    U[1] = -cos(scale*X[0])*sin(scale*X[1])*cos(scale*X[2])
     U[2] = 0
     solver.set_velocity(**context)
 
 def initialize2(solver, context):
     U, X = context.U, context.X
-    U[0] = sin(2*pi*X[0])*cos(2*pi*X[1])*cos(2*pi*X[2])
-    U[1] = -cos(2*pi*X[0])*sin(2*pi*X[1])*cos(2*pi*X[2])
+    scale = 1.0/config.params.L_ref
+    U[0] = sin(scale*X[0])*cos(scale*X[1])*cos(scale*X[2])
+    U[1] = -cos(scale*X[0])*sin(scale*X[1])*cos(scale*X[2])
     U[2] = 0
     solver.set_velocity(**context)
     solver.cross2(context.W_hat, context.K, context.U_hat)
@@ -91,6 +93,7 @@ def update(context):
     c = context
     params = config.params
     solver = config.solver
+    t_phys = params.t
 
     if (params.tstep % params.diag_interval == 0 or
             (params.plot_step > 0 and params.tstep % params.plot_step == 0)):
@@ -130,7 +133,7 @@ def update(context):
         should_compute = False
         if hasattr(params, 'snapshot_times_spectrum'):
             while (params.snapshot_index_spectrum < len(params.snapshot_times_spectrum) and 
-                   params.t >= params.snapshot_times_spectrum[params.snapshot_index_spectrum] - params.dt * 0.5):
+                   params.t >= params.snapshot_times_spectrum[params.snapshot_index_spectrum] - params.dt * 0.01):
                 should_compute = True
                 params.snapshot_index_spectrum += 1
                 
@@ -145,7 +148,7 @@ def update(context):
                 # Sanity Check
                 total_Ek = np.sum(Ek)
                 diff = abs(kk - total_Ek)
-                print("Sanity Check (t={:.4f}): KE_sim = {:.16e}, Sum(E_k) = {:.16e}, Diff = {:.6e}".format(params.t, kk, total_Ek, diff))
+                print("Sanity Check (t={:.4f}): KE_sim = {:.16e}, Sum(E_k) = {:.16e}, Diff = {:.6e}".format(t_phys, kk, total_Ek, diff))
 
                 # Save to HDF5
                 with h5py.File("energy_spectrum.h5", "a") as f:
@@ -153,7 +156,7 @@ def update(context):
                     if str(params.tstep) in grp:
                         del grp[str(params.tstep)]
                     dset = grp.create_dataset(str(params.tstep), data=Ek)
-                    dset.attrs["time"] = params.t
+                    dset.attrs["time"] = t_phys
                 
                 # Save to a text file for easy reading
                 out_dir = "spectrum"
@@ -161,7 +164,7 @@ def update(context):
                     os.makedirs(out_dir)
                     
                 txt_filename = os.path.join(out_dir, "spectrum_{:06d}.txt".format(params.tstep))
-                header = "Time: {:26.16e}\n{:>24},{:>26}".format(params.t, "k", "E(k)")
+                header = "Time: {:26.16e}\n{:>24},{:>26}".format(t_phys, "k", "E(k)")
                 np.savetxt(txt_filename, np.column_stack((centers, Ek)), header=header, delimiter=",")
                 print("Saved spectrum to {}".format(txt_filename))
 
@@ -175,12 +178,16 @@ def update(context):
         if solver.rank == 0:
             k.append(kk)
             w.append(ww)
-            print("%2.2f %2.8f %2.8e %2.8e" %(params.t, float(kk), float(ww2-kk), float(divu)))
+            if params.tstep == 0:
+                print("{:>26} {:>26} {:>26} {:>26}".format(
+                    "Time", "Cycle", "KineticEnergy", "Enstrophy"))
+            print("{:26.16e} {:26.16e} {:26.16e} {:26.16e}".format(
+                t_phys, float(params.tstep), float(kk), float(ww)))
             file_exists = os.path.isfile("diagnostics.csv")
             with open("diagnostics.csv", "a") as f:
                 if not file_exists:
-                    f.write("                      Time,                     Cycle,             KineticEnergy,                 Enstrophy,                Divergence\n")
-                f.write("%26.16e,%26.16e,%26.16e,%26.16e,%26.16e\n" %(params.t, float(params.tstep), float(kk), float(ww), float(divu)))
+                    f.write("                      Time,                     Cycle,             KineticEnergy,                 Enstrophy\n")
+                f.write("%26.16e,%26.16e,%26.16e,%26.16e\n" %(t_phys, float(params.tstep), float(kk), float(ww)))
 
 def regression_test(context):
     params = config.params
@@ -232,6 +239,8 @@ if __name__ == "__main__":
     config.triplyperiodic.add_argument("--num_spectrum_snapshots", type=int, default=0, help="Number of spectrum snapshots to save evenly distributed over T")
 
     config.triplyperiodic.add_argument("--Re", type=float, default=100.0, help="Reynolds number (defines viscosity)")
+    config.triplyperiodic.add_argument("--problem", type=int, default=2, choices=[1, 2],
+                                       help="Problem setup: 1 => domain [0, 2*pi]^3 (dt unchanged), 2 => domain [0, 1]^3 (dt scaled by 1/(2*pi))")
 
     config.triplyperiodic.add_argument("--N", default=[32, 32, 32], nargs=3,
 
@@ -243,9 +252,20 @@ if __name__ == "__main__":
 
     
 
-        # Define characteristic scales
+        # Define characteristic scales and domain
 
-    L_ref = 1.0 / (2*pi)
+    if config.params.problem == 1:
+        domain_length = 2*pi
+        L_ref = 1.0
+        time_scale = 1.0
+    else:
+        domain_length = 1.0
+        L_ref = 1.0 / (2*pi)
+        time_scale = L_ref
+
+    config.params.L = [domain_length, domain_length, domain_length]
+    config.params.time_scale = time_scale
+    config.params.L_ref = L_ref
 
     U_ref = 1.0
 
@@ -259,35 +279,25 @@ if __name__ == "__main__":
 
     
 
-        # Rescale dt (Non-dimensionalize dt)
-
-        # The input dt is assumed to be physical, so we scale it by 1/2pi to get simulation dt
+        # Rescale dt for problem 2: input dt is nondimensional, physical dt = dt * L_ref.
 
     input_dt = config.params.dt
 
-    config.params.dt = input_dt / (2*pi)
+    config.params.dt = input_dt * time_scale
 
     
 
-        # T is treated as Physical Time. 
-
-        # To stop the solver at the correct physical time, we must scale T by 1/2pi to match the scaled dt.
+        # T is treated as Physical Time and is not rescaled.
 
     input_T = config.params.T
 
-    config.params.T = input_T / (2*pi)
+    config.params.T = input_T
 
     
 
-        # Calculate snapshot step if provided
+        # Do not round snapshot_time to integer steps; use time-based tolerances instead.
 
     config.params.snapshot_step = -1
-
-    if config.params.snapshot_time >= 0:
-
-            # snapshot_time is physical, input_dt is physical.
-
-        config.params.snapshot_step = int(round(config.params.snapshot_time / input_dt))
 
     
 
@@ -304,9 +314,8 @@ if __name__ == "__main__":
         times = [i * config.params.T / config.params.num_snapshots for i in range(0, config.params.num_snapshots + 1)]
         
         if config.params.snapshot_time >= 0:
-             t_snap_sim = config.params.snapshot_time / (2*pi)
-             if t_snap_sim <= config.params.T:
-                 times.append(t_snap_sim)
+             if config.params.snapshot_time <= config.params.T:
+                 times.append(config.params.snapshot_time)
         
         times.sort()
         config.params.snapshot_times_fields = times
@@ -315,6 +324,12 @@ if __name__ == "__main__":
 
         if sol.rank == 0:
             print("num_snapshots={} -> Scheduled {} field snapshots by time.".format(config.params.num_snapshots, len(times)))
+    elif config.params.snapshot_time >= 0:
+        # Single time-based snapshot for fields
+        if config.params.snapshot_time <= config.params.T:
+            config.params.snapshot_times_fields = [config.params.snapshot_time]
+            config.params.snapshot_index_fields = 0
+            config.params.write_result = 2000000000 # Disable fixed interval
 
     
 
@@ -345,9 +360,8 @@ if __name__ == "__main__":
         times = [i * config.params.T / config.params.num_spectrum_snapshots for i in range(0, config.params.num_spectrum_snapshots + 1)]
         
         if config.params.snapshot_time >= 0:
-             t_snap_sim = config.params.snapshot_time / (2*pi)
-             if t_snap_sim <= config.params.T:
-                 times.append(t_snap_sim)
+             if config.params.snapshot_time <= config.params.T:
+                 times.append(config.params.snapshot_time)
         
         times.sort()
         config.params.snapshot_times_spectrum = times
@@ -356,14 +370,21 @@ if __name__ == "__main__":
 
         if sol.rank == 0:
             print("num_spectrum_snapshots={} -> Scheduled {} spectrum snapshots by time.".format(config.params.num_spectrum_snapshots, len(times)))
+    elif config.params.snapshot_time >= 0:
+        # Single time-based snapshot for spectrum
+        if config.params.snapshot_time <= config.params.T:
+            config.params.snapshot_times_spectrum = [config.params.snapshot_time]
+            config.params.snapshot_index_spectrum = 0
+            config.params.compute_spectrum = 2000000000 # Disable fixed interval
 
 
 
     if sol.rank == 0:
 
-        print("--- Taylor-Green Vortex Setup ([0, 1]^3) ---")
+        domain_label = "[0, 2*pi]^3" if config.params.problem == 1 else "[0, 1]^3"
+        print("--- Taylor-Green Vortex Setup ({}) ---".format(domain_label))
 
-        print("Reference Length (L): 1/2pi ({:.6f})".format(L_ref))
+        print("Reference Length (L): {:.6f}".format(L_ref))
 
         print("Reference Velocity (U): 1.0")
 
@@ -371,15 +392,14 @@ if __name__ == "__main__":
 
         print("Computed Viscosity (nu): {:.6g}".format(config.params.nu))
 
-        print("Input dt (Physical): {:g}".format(input_dt))
+        print("Input dt (User): {:g}".format(input_dt))
 
-        print("Simulation dt (Rescaled by 1/2pi): {:g}".format(config.params.dt))
+        print("Simulation dt (Used): {:g}".format(config.params.dt))
 
         print("End Time T (Physical): {:g}".format(input_T))
 
-        if config.params.snapshot_step >= 0:
-
-            print("Snapshot scheduled at physical t={:g} (step {})".format(config.params.snapshot_time, config.params.snapshot_step))
+        if config.params.snapshot_time >= 0:
+            print("Snapshot requested at physical t={:g}".format(config.params.snapshot_time))
 
         print("---------------------------------------------")
 
@@ -447,7 +467,7 @@ if __name__ == "__main__":
         should_write = False
         if hasattr(params, 'snapshot_times_fields'):
              while (params.snapshot_index_fields < len(params.snapshot_times_fields) and 
-                   params.t >= params.snapshot_times_fields[params.snapshot_index_fields] - params.dt * 0.5):
+                   params.t >= params.snapshot_times_fields[params.snapshot_index_fields] - params.dt * 0.01):
                 should_write = True
                 params.snapshot_index_fields += 1
                 
@@ -553,7 +573,7 @@ if __name__ == "__main__":
 
         if sol.rank == 0:
 
-            print("Performing final save at t={:g}...".format(config.params.t))
+            print("Performing final save at t={:g}...".format(config.params.t * 2*pi))
 
         update(context)
 
