@@ -17,7 +17,7 @@ ctypedef fused T:
     complex_t
 
 
-def Mult_Div_3D(np.int_t N,
+def Mult_Div_3D(long N,
                 np.ndarray[real_t, ndim=2] m,
                 np.ndarray[real_t, ndim=2] n,
                 np.ndarray[complex_t, ndim=3] u_hat,
@@ -34,7 +34,7 @@ def Mult_Div_3D(np.int_t N,
                         w_hat[:, i, j],
                         b[:, i, j])
 
-def Mult_Div_1D(np.int_t N,
+def Mult_Div_1D(long N,
                 real_t m,
                 real_t n,
                 np.ndarray[complex_t, ndim=1] u_hat,
@@ -159,7 +159,7 @@ cdef Mult_CTD_1D_ptr(int N,
     sum_u2 += w_hat[st]
     bw[0] = -sum_u2*2
 
-def Mult_CTD_3D_ptr(np.int_t N,
+def Mult_CTD_3D_ptr(long N,
                     complex_t[:, :, ::1] v_hat,
                     complex_t[:, :, ::1] w_hat,
                     complex_t[:, :, ::1] bv,
