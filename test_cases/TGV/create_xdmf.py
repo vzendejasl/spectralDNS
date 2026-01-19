@@ -1,16 +1,30 @@
 import h5py
 import os
+import argparse
+import glob
 
-# Configuration
-h5_filename = 'NS9_w.h5'
-xdmf_filename = 'NS9_w.xdmf'
+def generate_xdmf(input_dir):
+    # Search for the _w.h5 file in the specified directory
+    h5_files = glob.glob(os.path.join(input_dir, '*_w.h5'))
+    
+    if not h5_files:
+        # Try current directory if input_dir is specified but no file found
+        h5_files = glob.glob(os.path.join(input_dir, '*.h5'))
+        # Filter out checkpoint files (_c.h5)
+        h5_files = [f for f in h5_files if not f.endswith('_c.h5')]
 
-def generate_xdmf():
-    if not os.path.exists(h5_filename):
-        print(f"Error: {h5_filename} not found in current directory.")
+    if not h5_files:
+        print(f"Error: No valid HDF5 output files (*_w.h5) found in {input_dir}")
         return
 
-    with h5py.File(h5_filename, 'r') as f:
+    # Take the first match (usually there's only one _w.h5)
+    full_h5_path = h5_files[0]
+    h5_filename = os.path.basename(full_h5_path)
+    xdmf_filename = full_h5_path.replace('.h5', '.xdmf')
+
+    print(f"Processing: {full_h5_path}")
+
+    with h5py.File(full_h5_path, 'r') as f:
         variables = []
         for key in f.keys():
             if isinstance(f[key], h5py.Group) and '3D' in f[key]:
@@ -29,7 +43,12 @@ def generate_xdmf():
                 if key.isdigit():
                     timesteps.append(int(key))
         timesteps.sort()
-        print(f"Found {len(timesteps)} timesteps: {timesteps}")
+        
+        if not timesteps:
+            print("No timesteps found.")
+            return
+            
+        print(f"Found {len(timesteps)} timesteps.")
         
         x0 = f[first_var]['mesh']['x0']
         x1 = f[first_var]['mesh']['x1']
@@ -65,9 +84,9 @@ def generate_xdmf():
                 xdmf.write(f'    <Topology TopologyType="3DRectMesh" Dimensions="{n0} {n1} {n2}"/>\n')
                 
                 xdmf.write('    <Geometry GeometryType="VXVYVZ">\n')
-                xdmf.write(f'     <DataItem Dimensions="{n2}" NumberType="Float" Precision="8" Format="HDF">{h5_filename}:/{first_var}/mesh/x2</DataItem>\n')
-                xdmf.write(f'     <DataItem Dimensions="{n1}" NumberType="Float" Precision="8" Format="HDF">{h5_filename}:/{first_var}/mesh/x1</DataItem>\n')
                 xdmf.write(f'     <DataItem Dimensions="{n0}" NumberType="Float" Precision="8" Format="HDF">{h5_filename}:/{first_var}/mesh/x0</DataItem>\n')
+                xdmf.write(f'     <DataItem Dimensions="{n1}" NumberType="Float" Precision="8" Format="HDF">{h5_filename}:/{first_var}/mesh/x1</DataItem>\n')
+                xdmf.write(f'     <DataItem Dimensions="{n2}" NumberType="Float" Precision="8" Format="HDF">{h5_filename}:/{first_var}/mesh/x2</DataItem>\n')
                 xdmf.write('    </Geometry>\n')
                 
                 for var in variables:
@@ -83,7 +102,7 @@ def generate_xdmf():
                         xdmf.write('    </Attribute>\n')
                     
                     elif len(shape) == 4 and shape[0] == 3:
-                        # 1. Write Vector Attribute (Combined)
+                        # Vector Attribute
                         xdmf.write(f'    <Attribute Name="{var}" AttributeType="Vector" Center="Node">\n')
                         xdmf.write(f'     <DataItem ItemType="Function" Function="JOIN($0, $1, $2)" Dimensions="{n0} {n1} {n2} 3">\n')
                         for i in range(3):
@@ -94,23 +113,16 @@ def generate_xdmf():
                         xdmf.write('     </DataItem>\n')
                         xdmf.write('    </Attribute>\n')
 
-                        # 2. Write Scalar Components (Optional but helpful)
-                        comps = ['X', 'Y', 'Z']
-                        for i, c in enumerate(comps):
-                            xdmf.write(f'    <Attribute Name="{var}_{c}" AttributeType="Scalar" Center="Node">\n')
-                            xdmf.write(f'     <DataItem ItemType="HyperSlab" Dimensions="{n0} {n1} {n2}" Type="HyperSlab">\n')
-                            xdmf.write(f'      <DataItem Dimensions="3 4" Format="XML">{i} 0 0 0 1 1 1 1 1 {n0} {n1} {n2}</DataItem>\n')
-                            xdmf.write(f'      <DataItem Dimensions="3 {n0} {n1} {n2}" NumberType="Float" Precision="8" Format="HDF">{h5_filename}:/{ds_path}</DataItem>\n')
-                            xdmf.write('     </DataItem>\n')
-                            xdmf.write('    </Attribute>\n')
-
                 xdmf.write('   </Grid>\n')
             
             xdmf.write('  </Grid>\n')
             xdmf.write(' </Domain>\n')
             xdmf.write('</Xdmf>\n')
     
-    print(f"Successfully generated {xdmf_filename} with Vectors!")
+    print(f"Successfully generated: {xdmf_filename}")
 
 if __name__ == "__main__":
-    generate_xdmf()
+    parser = argparse.ArgumentParser(description='Generate XDMF for spectralDNS HDF5 output.')
+    parser.add_argument('--dir', type=str, default='.', help='Directory containing HDF5 files')
+    args = parser.parse_args()
+    generate_xdmf(args.dir)
