@@ -5,13 +5,15 @@ import os
 import sys
 import glob
 import warnings
+import csv
 
 import numpy as np
 from numpy import pi, zeros, sum, float64, sin, cos, prod
 import h5py
+from mpi4py import MPI
 
 from shenfun.fourier import energy_fourier
-from shenfun import ShenfunFile
+from shenfun import ShenfunFile, Array, Function
 from spectralDNS import config, get_solver, solve
 
 try:
@@ -100,6 +102,24 @@ def _base_filename(params):
 
 def _diagnostics_filename(params):
     return _base_filename(params) + ".csv"
+
+def _turb_filename(params):
+    return "tgv_out_turb_Re{}NumPtsPerDir{}.csv".format(
+        _format_re(params.Re),
+        int(params.N[0]),
+    )
+
+def _turb_continued_filename(params):
+    return "tgv_out_turb_continued_Re{}NumPtsPerDir{}.csv".format(
+        _format_re(params.Re),
+        int(params.N[0]),
+    )
+
+def _turb_grid_filename(params):
+    return "tgv_out_turb_grid_Re{}NumPtsPerDir{}.csv".format(
+        _format_re(params.Re),
+        int(params.N[0]),
+    )
 
 
 # -------------------------
@@ -226,9 +246,12 @@ w = []
 im1 = None
 kold = zeros(1)
 
+# Global temporary array for gradients to avoid reallocation if possible
+# Note: In a real persistent application we might attach this to context
+_grad_u = None
 
 def update(context):
-    global k, w, im1
+    global k, w, im1, _grad_u
     c = context
     params = config.params
     solver = config.solver
@@ -241,7 +264,7 @@ def update(context):
         U = solver.get_velocity(**c)
         curl = solver.get_curl(**c)
         if 'NS' in params.solver:
-            solver.get_pressure(**c)
+            P = solver.get_pressure(**c)
 
     if plt is not None:
         if plot_step > 0 and params.tstep % plot_step == 0 and solver.rank == 0:
@@ -267,8 +290,195 @@ def update(context):
             pass
 
     if params.tstep % diag_interval == 0:
-        ww = solver.comm.reduce(sum(curl.astype(float64) * curl.astype(float64)) / prod(params.N) / 2)
-        kk = solver.comm.reduce(sum(U.astype(float64) * U.astype(float64)) / prod(params.N) / 2)
+        
+        # 1. Basic stats
+        ww = solver.comm.allreduce(sum(curl.astype(float64) * curl.astype(float64)) / prod(params.N) / 2)
+        kk = solver.comm.allreduce(sum(U.astype(float64) * U.astype(float64)) / prod(params.N) / 2)
+
+        # 2. Detailed Turbulence Stats
+        
+        local_diss = np.zeros_like(U[0], dtype=float64)
+        
+        # Longitudinal moments and component sums
+        sum_long_d2 = 0.0 
+        sum_long_d3 = 0.0 
+        sum_long_d4 = 0.0
+        
+        sum_u2_comp1 = np.sum(U[0]**2)
+        sum_u2_comp3 = np.sum(U[2]**2)
+        
+        sum_grad_u1_sq = 0.0 
+        sum_grad_u3_sq = 0.0
+        
+        # Evaluation of L-inf norms
+        u_inf_loc = np.max(np.abs(U))
+        p_inf_loc = np.max(np.abs(P)) if 'NS' in params.solver else 0.0
+        
+        # Evaluation of CFL
+        # CFL = max(|u_i|) * dt / dx
+        dx = params.L[0] / params.N[0]
+        
+        # Temporary spectral buffers
+        grad_hat = Function(c.T)
+        grad_phys = Array(c.T)
+        grad_hat_j = Function(c.T) 
+        grad_phys_j = Array(c.T)
+        
+        local_diss[:] = 0.0
+        
+        # Diagonals: du/dx, dv/dy, dw/dz
+        for i in range(3):
+            grad_hat[:] = 1j * c.K[i] * c.U_hat[i]
+            grad_phys = grad_hat.backward(grad_phys)
+            
+            # Dissipation part
+            local_diss += grad_phys.real**2
+            
+            # Skew/Flat part
+            d_val = grad_phys.real
+            d2 = d_val**2
+            sum_long_d2 += np.sum(d2)
+            sum_long_d3 += np.sum(d2 * d_val)
+            sum_long_d4 += np.sum(d2 * d2)
+            
+            # D3/D1 part
+            if i == 0: sum_grad_u1_sq += np.sum(d2)
+            if i == 2: sum_grad_u3_sq += np.sum(d2)
+        
+        # Off-diagonals
+        pairs = [(0,1), (0,2), (1,2)]
+        for (i, j) in pairs:
+            grad_hat[:] = 1j * c.K[j] * c.U_hat[i]
+            grad_phys = grad_hat.backward(grad_phys)
+            val_ij = grad_phys.real
+            
+            grad_hat_j[:] = 1j * c.K[i] * c.U_hat[j]
+            grad_phys_j = grad_hat_j.backward(grad_phys_j)
+            val_ji = grad_phys_j.real
+            
+            S_ij = 0.5 * (val_ij + val_ji)
+            local_diss += 2.0 * S_ij**2 
+            
+            if i == 0: sum_grad_u1_sq += np.sum(val_ij**2)
+            elif i == 2: sum_grad_u3_sq += np.sum(val_ij**2)
+                
+            if j == 0: sum_grad_u1_sq += np.sum(val_ji**2)
+            elif j == 2: sum_grad_u3_sq += np.sum(val_ji**2)
+            
+        local_diss *= 2.0 * params.nu
+        
+        # Global reductions
+        max_diss = solver.comm.allreduce(np.max(local_diss), op=MPI.MAX)
+        total_diss = solver.comm.allreduce(np.sum(local_diss), op=MPI.SUM)
+        avg_diss = total_diss / prod(params.N)
+        
+        glob_sum_long_d2 = solver.comm.allreduce(sum_long_d2, op=MPI.SUM)
+        glob_sum_long_d3 = solver.comm.allreduce(sum_long_d3, op=MPI.SUM)
+        glob_sum_long_d4 = solver.comm.allreduce(sum_long_d4, op=MPI.SUM)
+        
+        glob_sum_u2_c1 = solver.comm.allreduce(sum_u2_comp1, op=MPI.SUM)
+        glob_sum_u2_c3 = solver.comm.allreduce(sum_u2_comp3, op=MPI.SUM)
+        
+        glob_sum_grad_u1_sq = solver.comm.allreduce(sum_grad_u1_sq, op=MPI.SUM)
+        glob_sum_grad_u3_sq = solver.comm.allreduce(sum_grad_u3_sq, op=MPI.SUM)
+        
+        u_inf = solver.comm.allreduce(u_inf_loc, op=MPI.MAX)
+        p_inf = solver.comm.allreduce(p_inf_loc, op=MPI.MAX)
+        
+        vol_points = prod(params.N)
+        cfl = u_inf * params.dt / dx
+        
+        # Calculate derived quantities
+        avg_long_d2 = (glob_sum_long_d2 / vol_points) / 3.0
+        avg_long_d3 = (glob_sum_long_d3 / vol_points) / 3.0
+        avg_long_d4 = (glob_sum_long_d4 / vol_points) / 3.0
+        
+        skewness = avg_long_d3 / (avg_long_d2**1.5) if avg_long_d2 > 0 else 0.0
+        flatness = avg_long_d4 / (avg_long_d2**2.0) if avg_long_d2 > 0 else 0.0
+        
+        D3_over_D1 = glob_sum_grad_u3_sq / glob_sum_grad_u1_sq if glob_sum_grad_u1_sq > 0 else 0.0
+        E3_over_E1 = glob_sum_u2_c3 / glob_sum_u2_c1 if glob_sum_u2_c1 > 0 else 0.0
+        
+        avg_SijSij = (total_diss / (2.0 * params.nu)) / vol_points if params.nu > 0 else 0.0
+        
+        # Derived turbulence scales
+        if avg_diss > 1e-20:
+            kolmLenScl = (params.nu**3 / max_diss)**0.25 if max_diss > 0 else 0.0
+            avg_kolmLenScl = (params.nu**3 / avg_diss)**0.25
+            avg_lambda = np.sqrt(10.0 * params.nu * kk / avg_diss)
+            kolmTimeScl = np.sqrt(params.nu / max_diss) if max_diss > 0 else 0.0
+            avg_kolmTimeScl = np.sqrt(params.nu / avg_diss)
+        else:
+            kolmLenScl = 0.0
+            avg_kolmLenScl = 0.0
+            avg_lambda = 0.0
+            kolmTimeScl = 0.0
+            avg_kolmTimeScl = 0.0
+
+        u_rms = np.sqrt(2.0/3.0 * kk)
+        Re_taylor = u_rms * avg_lambda / params.nu if params.nu > 0 else 0.0
+        
+        # Grid metrics
+        kmax = pi / dx
+        kmax_eta = kmax * kolmLenScl
+        hmin_eta = dx / kolmLenScl if kolmLenScl > 0 else 0.0
+        avg_kmax_eta = kmax * avg_kolmLenScl
+        avg_hmin_eta = dx / avg_kolmLenScl if avg_kolmLenScl > 0 else 0.0
+        
+        # PI_nu estimate (approximate vel_curl_ke as 2*enstrophy in incompressible)
+        vel_curl_ke = 2.0 * ww
+        PI_nu = pow(avg_diss, 0.5) / (avg_kolmLenScl * pow(vel_curl_ke, 0.75)) if avg_kolmLenScl > 0 and vel_curl_ke > 0 else 0.0
+        PI_nu_min = pow(max_diss, 0.5) / (kolmLenScl * pow(vel_curl_ke, 0.75)) if kolmLenScl > 0 and vel_curl_ke > 0 else 0.0
+
+        # Save to CSVs
+        if solver.rank == 0:
+            header_fmt = "%26s," * 3 + "%26s\n"
+            data_fmt = "    %22.16e," * 3 + "    %22.16e\n"
+            
+            # Main Diagnostics
+            diag_file = params.diagnostics_filename
+            file_exists = os.path.isfile(diag_file)
+            with open(diag_file, "a") as f:
+                if not file_exists:
+                    f.write("%26s,%26s,%26s,%26s,%26s,%26s,%26s\n" % ("Time", "Cycle", "u_inf", "p_inf", "KineticEnergy", "Enstrophy", "CFL"))
+                f.write("    %22.16e,    %22.16e,    %22.16e,    %22.16e,    %22.16e,    %22.16e,    %22.16e\n" % 
+                        (t_phys, float(params.tstep), u_inf, p_inf, float(kk), float(ww), cfl))
+
+            # Turb Stats
+            turb_file = os.path.join(params.output_dir, _turb_filename(params))
+            file_exists = os.path.isfile(turb_file)
+            with open(turb_file, "a") as f:
+                if not file_exists:
+                    f.write("%26s,%26s,%26s,%26s,%26s,%26s,%26s,%26s,%26s,%26s,%26s\n" % 
+                            ("Time", "Cycle", "MaxDissipation", "AvgDissipation", "MinKolmLen", "TaylorLen", "AvgKolmLen", "MinKolmTime", "AvgKolmTime", "ReTaylor", "u_rms"))
+                f.write(("    %22.16e,"*10 + "    %22.16e\n") % 
+                        (t_phys, float(params.tstep), max_diss, avg_diss, kolmLenScl, avg_lambda, avg_kolmLenScl, kolmTimeScl, avg_kolmTimeScl, Re_taylor, u_rms))
+            
+            # Turb Continued Stats
+            turb_cont_file = os.path.join(params.output_dir, _turb_continued_filename(params))
+            file_exists = os.path.isfile(turb_cont_file)
+            with open(turb_cont_file, "a") as f:
+                if not file_exists:
+                    f.write("%26s,%26s,%26s,%26s,%26s,%26s,%26s\n" % ("Time", "Cycle", "avg_SijSij", "Skewness", "Flatness", "D31", "E31"))
+                f.write("    %22.16e,    %22.16e,    %22.16e,    %22.16e,    %22.16e,    %22.16e,    %22.16e\n" % 
+                        (t_phys, float(params.tstep), avg_SijSij, skewness, flatness, D3_over_D1, E3_over_E1))
+
+            # Turb Grid Stats
+            turb_grid_file = os.path.join(params.output_dir, _turb_grid_filename(params))
+            file_exists = os.path.isfile(turb_grid_file)
+            with open(turb_grid_file, "a") as f:
+                if not file_exists:
+                    f.write("%26s,%26s,%26s,%26s,%26s,%26s,%26s,%26s\n" % 
+                            ("Time", "Cycle", "Kmax*eta", "hmin/eta", "Avg_PI_NU", "Min_PI_NU", "Kmax*eta(Avg)", "hmin/eta(Avg)"))
+                f.write(("    %22.16e,"*7 + "    %22.16e\n") % 
+                        (t_phys, float(params.tstep), kmax_eta, hmin_eta, PI_nu, PI_nu_min, avg_kmax_eta, avg_hmin_eta))
+
+            # Print to stdout for user
+            if params.tstep == 0:
+                print("{:>26} {:>26} {:>26} {:>26}".format("Time", "Cycle", "KineticEnergy", "Enstrophy"))
+            print("{:26.16e} {:26.16e} {:26.16e} {:26.16e}".format(
+                t_phys, float(params.tstep), float(kk), float(ww)
+            ))
 
         # Trigger spectrum calculation
         should_compute = False
@@ -313,36 +523,14 @@ def update(context):
         if 'NS' not in params.solver:
             c.U_hat = c.U.forward(c.U_hat)
 
-        ww2 = energy_fourier(c.U_hat, c.T) / 2
-
-        divu = solver.get_divergence(**context)
-        divu = solver.comm.reduce(sum(divu.astype(float64) * divu.astype(float64)) / prod(params.N) / 2)
-
-        kold[0] = kk
-        if solver.rank == 0:
-            k.append(kk)
-            w.append(ww)
-            if params.tstep == 0:
-                print("{:>26} {:>26} {:>26} {:>26}".format("Time", "Cycle", "KineticEnergy", "Enstrophy"))
-            print("{:26.16e} {:26.16e} {:26.16e} {:26.16e}".format(
-                t_phys, float(params.tstep), float(kk), float(ww)
-            ))
-
-            diag_file = params.get("diagnostics_filename", "diagnostics.csv")
-            file_exists = os.path.isfile(diag_file)
-            with open(diag_file, "a") as f:
-                if not file_exists:
-                    f.write("                      Time,                     Cycle,             KineticEnergy,                 Enstrophy\n")
-                f.write("%26.16e,%26.16e,%26.16e,%26.16e\n" % (t_phys, float(params.tstep), float(kk), float(ww)))
-
 
 def regression_test(context):
     params = config.params
     solver = config.solver
     U = solver.get_velocity(**context)
     curl = solver.get_curl(**context)
-    wv = solver.comm.reduce(sum(curl.astype(float64) * curl.astype(float64)) / prod(params.N) / 2)
-    kv = solver.comm.reduce(sum(U.astype(float64) * U.astype(float64)) / prod(params.N) / 2)
+    wv = solver.comm.allreduce(sum(curl.astype(float64) * curl.astype(float64)) / prod(params.N) / 2)
+    kv = solver.comm.allreduce(sum(U.astype(float64) * U.astype(float64)) / prod(params.N) / 2)
     config.solver.MemoryUsage('End')
     if solver.rank == 0:
         try:
@@ -492,7 +680,7 @@ if __name__ == "__main__":
 
     context.hdf5file.update_components = update_components
 
-    # Custom HDF5 update (IMPORTANT: do NOT use hasattr(params, ...) here)
+    # Custom HDF5 update
     def custom_update(params, **kw):
         self = context.hdf5file
 
@@ -526,36 +714,9 @@ if __name__ == "__main__":
             if params.tstep % params.write_result == 0:
                 should_write = True
 
-        is_snapshot = (params.get('snapshot_step', -1) >= 0) and (params.tstep == params.snapshot_step)
-        if snapshot_times_fields is None and is_snapshot:
-            should_write = True
-
         if should_write:
             self.update_components(**kw)
             self.wfile.write(params.tstep, self.results['data'], as_scalar=False)
-
-            # Tag each written dataset with "time" attribute when possible
-            try:
-                close_after = False
-                if self.wfile.f is None:
-                    self.wfile.open()
-                    close_after = True
-
-                for key in self.results['data'].keys():
-                    try:
-                        if key in self.wfile.f and '3D' in self.wfile.f[key] and str(params.tstep) in self.wfile.f[key]['3D']:
-                            self.wfile.f[key]['3D'][str(params.tstep)].attrs['time'] = params.t
-                    except Exception as e:
-                        if sol.rank == 0:
-                            print(f"Warning: Could not save time attribute: {e}")
-
-                if close_after:
-                    self.wfile.close()
-            except Exception as e:
-                if sol.rank == 0:
-                    print(f"Warning: Could not open file to save time attribute: {e}")
-
-            # Checkpoint whenever a snapshot is written
             for key, val in self.checkpoint['data'].items():
                 self.cfile.write(int(key), val)
             self.cfile.open()
@@ -566,9 +727,6 @@ if __name__ == "__main__":
             if sol.rank == 0:
                 print(f"Checkpoint written at step {params.tstep} (t={params.t:.16e})")
 
-            if is_snapshot and sol.rank == 0:
-                print(f"Snapshot fields saved at step {params.tstep}")
-
         kill = self.check_if_kill()
         if (params.tstep % params.checkpoint == 0 or kill) and not checkpoint_written:
             for key, val in self.checkpoint['data'].items():
@@ -577,10 +735,8 @@ if __name__ == "__main__":
                 self.cfile.f.attrs['tstep'] = params.tstep
                 self.cfile.f.attrs['t'] = params.t
                 self.cfile.close()
-
             if sol.rank == 0:
                 print(f"Checkpoint written at step {params.tstep} (t={params.t:.16e})")
-
             if kill:
                 sys.exit(1)
 
@@ -590,30 +746,12 @@ if __name__ == "__main__":
     restarted = _load_restart(sol, context)
     if not restarted:
         initialize(sol, context)
-        if sol.rank == 0:
-            print("Performing initial save at t=0...")
         update(context)
         context.hdf5file.update(config.params, **context)
-    elif sol.rank == 0:
-        print("Restart: continuing from checkpoint, skipping initial save.")
 
     # Solve
     solve(sol, context)
 
-    # Final save at end (if needed)
-    should_final_save = False
-    if config.params.get('snapshot_times_fields', None) is not None:
-        if config.params.snapshot_index_fields < len(config.params.snapshot_times_fields):
-            should_final_save = True
-    else:
-        if config.params.tstep % config.params.write_result != 0:
-            should_final_save = True
-
-    if should_final_save:
-        if sol.rank == 0:
-            print(f"Performing final save at t={config.params.t:g}...")
-        update(context)
-        context.hdf5file.update(config.params, **context)
-
+    # Final save
     if sol.rank == 0:
         print("Done.")
